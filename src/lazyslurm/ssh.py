@@ -27,11 +27,14 @@ it, re-authenticating only if the master is gone too.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import os
 import pty
 import re
 import shlex
+import subprocess
+import termios
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -75,13 +78,39 @@ _SSH_BASE_OPTS = [
 ]
 
 
+def ssh_target(host: str) -> str:
+    """`user@hostname:port` as ssh resolves `host`, ssh config aliases included.
+
+    `daic` and `jdoe@login.daic.tudelft.nl` are the same machine; keyed on what
+    was typed they got a socket each, and switching spelling meant logging in
+    again (#79). Falls back to `host` itself when ssh cannot say.
+    """
+    try:
+        result = subprocess.run(
+            ["ssh", "-G", host], capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return host
+    if result.returncode != 0:
+        return host
+    fields: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        if key in ("user", "hostname", "port"):
+            fields[key] = value.strip()
+    if len(fields) < 3:
+        return host
+    return f"{fields['user']}@{fields['hostname']}:{fields['port']}"
+
+
 def _control_path(host: str) -> str:
     """A short, stable control-socket path for `host`.
 
     Not ssh's own %C token: the path is needed before the connection exists.
     Unix sockets are length-limited, hence the hash rather than the host name.
+    Hashes the resolved target, so every spelling of one host shares a socket.
     """
-    digest = hashlib.sha256(host.encode()).hexdigest()[:16]
+    digest = hashlib.sha256(ssh_target(host).encode()).hexdigest()[:16]
     return str(_CONTROL_DIR / f"{digest}.sock")
 
 
@@ -187,7 +216,7 @@ class SSHSession:
             self._master = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=child_fd, stdout=child_fd, stderr=child_fd,
-                start_new_session=True,
+                preexec_fn=_take_controlling_tty,
             )
         except OSError as e:
             os.close(parent_fd)
@@ -427,6 +456,19 @@ class SSHSession:
             except OSError:
                 pass
         await self._kill_master()
+
+
+def _take_controlling_tty() -> None:
+    """Run in the ssh child: a new session whose controlling terminal is the pty.
+
+    ssh reads passwords and verification codes from /dev/tty, not stdin, and
+    /dev/tty is the *controlling* terminal. Handing the pty over as stdin does
+    not make it that: after setsid() the child has none, and ssh gives up with
+    "read_passphrase: can't open /dev/tty" -- which reaches the user as
+    "Permission denied" without a prompt ever having been shown.
+    """
+    os.setsid()
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
 
 def _read_fd(fd: int) -> str:
