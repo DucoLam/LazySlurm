@@ -78,6 +78,23 @@ _SSH_BASE_OPTS = [
 ]
 
 
+def _ssh_settings(host: str) -> dict[str, str]:
+    """What `ssh -G` resolves for `host`: the user's ssh config, applied."""
+    try:
+        result = subprocess.run(
+            ["ssh", "-G", host], capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if result.returncode != 0:
+        return {}
+    settings: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        settings.setdefault(key, value.strip())
+    return settings
+
+
 def ssh_target(host: str) -> str:
     """`user@hostname:port` as ssh resolves `host`, ssh config aliases included.
 
@@ -85,22 +102,21 @@ def ssh_target(host: str) -> str:
     was typed they got a socket each, and switching spelling meant logging in
     again (#79). Falls back to `host` itself when ssh cannot say.
     """
-    try:
-        result = subprocess.run(
-            ["ssh", "-G", host], capture_output=True, text=True, timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
+    settings = _ssh_settings(host)
+    if not all(settings.get(k) for k in ("user", "hostname", "port")):
         return host
-    if result.returncode != 0:
-        return host
-    fields: dict[str, str] = {}
-    for line in result.stdout.splitlines():
-        key, _, value = line.partition(" ")
-        if key in ("user", "hostname", "port"):
-            fields[key] = value.strip()
-    if len(fields) < 3:
-        return host
-    return f"{fields['user']}@{fields['hostname']}:{fields['port']}"
+    return f"{settings['user']}@{settings['hostname']}:{settings['port']}"
+
+
+def user_control_path(host: str) -> str:
+    """The ControlPath the user's own ssh config sets for `host`, or "".
+
+    With `ControlMaster auto` there, a plain `ssh host` leaves a connection
+    behind that later ones reuse without asking for anything. LazySlurm can
+    ride the same one instead of logging in again.
+    """
+    path = _ssh_settings(host).get("controlpath", "")
+    return "" if path.lower() in ("", "none") else path
 
 
 def _control_path(host: str) -> str:
@@ -140,6 +156,9 @@ class SSHSession:
         self._channel_command = channel_command
         self._use_master = channel_command is None
         self.control_path = _control_path(host)
+        # True while riding the user's own ssh master (see _start_master):
+        # theirs to keep, so close() must leave it running.
+        self._borrowed = False
 
         self._master: asyncio.subprocess.Process | None = None
         self._master_pty: int | None = None
@@ -178,15 +197,16 @@ class SSHSession:
                 return False, msg
             return True, f"Connected to {self.host}"
 
-    async def _master_alive(self) -> bool:
+    async def _master_alive(self, control_path: str | None = None) -> bool:
         """Ask ssh whether the multiplexing master is up (`ssh -O check`).
 
-        False when ssh itself is missing: the caller reports "cannot connect",
-        which is true and useful, rather than raising out of the poll loop.
+        Checks this session's socket unless given another. False when ssh
+        itself is missing: the caller reports "cannot connect", which is true
+        and useful, rather than raising out of the poll loop.
         """
         try:
             proc = await asyncio.create_subprocess_exec(
-                "ssh", "-o", f"ControlPath={self.control_path}",
+                "ssh", "-o", f"ControlPath={control_path or self.control_path}",
                 "-O", "check", self.host,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -201,6 +221,15 @@ class SSHSession:
         The pty is what makes 2FA work: ssh opens /dev/tty for prompts, so with
         plain pipes the verification-code question would never reach us.
         """
+        # An already-authenticated connection from the user's own ssh config
+        # (`ssh daic` with ControlMaster) needs no password. Otherwise, back
+        # to LazySlurm's own socket: the borrowed one may have gone away.
+        borrowed = user_control_path(self.host)
+        if borrowed and await self._master_alive(borrowed):
+            self.control_path, self._borrowed = borrowed, True
+            return True, "Reusing your ssh connection"
+        self.control_path, self._borrowed = _control_path(self.host), False
+
         if await self._master_alive():
             return True, "Reusing existing SSH master"
 
@@ -443,7 +472,7 @@ class SSHSession:
         """Close the channel and tear the connection down."""
         self._closed = True
         await self._kill_channel()
-        if self._use_master:
+        if self._use_master and not self._borrowed:
             # Ask ssh to close the master cleanly, then make sure it is gone.
             try:
                 proc = await asyncio.create_subprocess_exec(

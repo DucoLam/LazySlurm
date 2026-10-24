@@ -398,7 +398,7 @@ class _FakeAuthSession(SSHSession):
     def _master_argv(self):
         return [sys.executable, "-u", self._script, self._ready]
 
-    async def _master_alive(self):
+    async def _master_alive(self, control_path=None):
         return os.path.exists(self._ready)
 
 
@@ -695,3 +695,68 @@ def test_a_genuinely_dead_master_is_still_restarted(monkeypatch):
 
     _run(scenario())
     assert len(logins) == 2, "a dropped connection has to re-authenticate"
+
+
+# ---------------------------------------------------------------------------
+# Riding the user's own ssh master
+# ---------------------------------------------------------------------------
+
+
+def test_a_live_master_from_the_users_ssh_config_is_reused(monkeypatch):
+    """`ssh daic` with ControlMaster left a connection; no password needed."""
+    monkeypatch.setattr(ssh_module, "user_control_path", lambda host: "/home/me/.ssh/cm-daic")
+    session = SSHSession("daic", prompt_cb=None)
+    checked = []
+
+    async def alive(control_path=None):
+        checked.append(control_path)
+        return control_path == "/home/me/.ssh/cm-daic"
+
+    async def no_master_please():
+        raise AssertionError("must not start a master of its own")
+
+    monkeypatch.setattr(session, "_master_alive", alive)
+    monkeypatch.setattr(session, "_master_argv", no_master_please)
+    ok, msg = _run(session._start_master())
+    assert ok and "your ssh connection" in msg
+    assert session.control_path == "/home/me/.ssh/cm-daic"
+    assert session._borrowed
+
+
+def test_a_borrowed_master_is_left_running_on_close(monkeypatch):
+    session = SSHSession("daic")
+    session._borrowed = True
+    spawned = []
+
+    async def fake_exec(*argv, **kwargs):
+        spawned.append(argv)
+        raise AssertionError("close must not touch the user's master")
+
+    monkeypatch.setattr(ssh_module.asyncio, "create_subprocess_exec", fake_exec)
+    _run(session.close())
+    assert spawned == []
+
+
+def test_without_a_live_user_master_it_logs_in_on_its_own_socket(monkeypatch):
+    monkeypatch.setattr(ssh_module, "user_control_path", lambda host: "/home/me/.ssh/cm-daic")
+    session = SSHSession("daic")
+    session.control_path, session._borrowed = "/home/me/.ssh/cm-daic", True  # from before
+
+    async def alive(control_path=None):
+        return False
+
+    monkeypatch.setattr(session, "_master_alive", alive)
+    monkeypatch.setattr(session, "_master_argv", lambda: ["false"])
+    _run(session._start_master())
+    assert session.control_path == _control_path("daic")
+    assert not session._borrowed
+
+
+def test_user_control_path_reads_ssh_config(monkeypatch):
+    monkeypatch.setattr(ssh_module, "_ssh_settings",
+                        lambda host: {"controlpath": "/home/me/.ssh/cm-x"})
+    assert ssh_module.user_control_path("x") == "/home/me/.ssh/cm-x"
+    monkeypatch.setattr(ssh_module, "_ssh_settings", lambda host: {"controlpath": "none"})
+    assert ssh_module.user_control_path("x") == ""
+    monkeypatch.setattr(ssh_module, "_ssh_settings", lambda host: {})
+    assert ssh_module.user_control_path("x") == ""
